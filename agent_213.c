@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -12,16 +13,35 @@
 #define AUTH_TOKEN "OPS-2213"
 #define SID_TAG "SID:3122"
 #define BUFFER_SIZE 2048
+#define LOG_FILE "remoteops.log"
 
-void execute_system_command(int sock, const char *cmd) {
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void log_event(const char *event_type, const char *client_ip, const char *details) {
+    pthread_mutex_lock(&log_mutex);
+    FILE *fp = fopen(LOG_FILE, "a");
+    if (fp) {
+        time_t now = time(NULL);
+        char time_str[64];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+        fprintf(fp, "[%s] [%s] [%s] %s\n", time_str, event_type, client_ip, details);
+        fclose(fp);
+    }
+    pthread_mutex_unlock(&log_mutex);
+}
+
+void execute_system_command(int sock, const char *cmd, const char *client_ip) {
     FILE *fp;
     char path[1024];
 
     if (strstr(cmd, "rm -rf") || strstr(cmd, ":(){ :|:& };:")) {
         char *err_msg = "ERROR COMMAND_BLOCKED_SECURITY\n";
         send(sock, err_msg, strlen(err_msg), 0);
+        log_event("SECURITY_BLOCK", client_ip, cmd);
         return;
     }
+
+    log_event("EXEC_CMD", client_ip, cmd);
 
     fp = popen(cmd, "r");
     if (fp == NULL) {
@@ -42,7 +62,7 @@ void execute_system_command(int sock, const char *cmd) {
     send(sock, footer, strlen(footer), 0);
 }
 
-void handle_file_put(int sock, const char *filename, long filesize) {
+void handle_file_put(int sock, const char *filename, long filesize, const char *client_ip) {
     FILE *fp = fopen(filename, "wb");
     if (!fp) {
         char *resp = "ERROR FILE_OPEN_FAILED\n";
@@ -67,9 +87,13 @@ void handle_file_put(int sock, const char *filename, long filesize) {
     char *done = "FILE_STORED_OK\n";
     send(sock, done, strlen(done), 0);
     printf("[Agent] Stored uploaded file: %s (%ld bytes)\n", filename, filesize);
+
+    char log_buf[256];
+    snprintf(log_buf, sizeof(log_buf), "Uploaded: %s (%ld bytes)", filename, filesize);
+    log_event("FILE_PUT", client_ip, log_buf);
 }
 
-void handle_file_get(int sock, const char *filename) {
+void handle_file_get(int sock, const char *filename, const char *client_ip) {
     FILE *fp = fopen(filename, "rb");
     if (!fp) {
         char *resp = "ERROR FILE_NOT_FOUND\n";
@@ -85,7 +109,6 @@ void handle_file_get(int sock, const char *filename) {
     snprintf(header, sizeof(header), "FILE_DATA %ld\n", filesize);
     send(sock, header, strlen(header), 0);
 
-    // Header එක සහ Data වෙන්ව හඳුනාගැනීම සඳහා කෙටි ප්‍රමාදයක් (delay)
     usleep(50000);
 
     char buffer[BUFFER_SIZE];
@@ -96,14 +119,28 @@ void handle_file_get(int sock, const char *filename) {
 
     fclose(fp);
     printf("[Agent] Sent file: %s (%ld bytes)\n", filename, filesize);
+
+    char log_buf[256];
+    snprintf(log_buf, sizeof(log_buf), "Downloaded: %s (%ld bytes)", filename, filesize);
+    log_event("FILE_GET", client_ip, log_buf);
 }
 
-void *handle_client(void *socket_desc) {
-    int sock = *(int *)socket_desc;
-    free(socket_desc);
+struct client_info {
+    int sock;
+    char ip[INET_ADDRSTRLEN];
+};
+
+void *handle_client(void *arg) {
+    struct client_info *cinfo = (struct client_info *)arg;
+    int sock = cinfo->sock;
+    char client_ip[INET_ADDRSTRLEN];
+    strncpy(client_ip, cinfo->ip, INET_ADDRSTRLEN);
+    free(cinfo);
 
     char buffer[BUFFER_SIZE];
     int authenticated = 0;
+
+    log_event("CONNECT", client_ip, "New connection established");
 
     char greeting[128];
     snprintf(greeting, sizeof(greeting), "OK CONNECTED %s\n", SID_TAG);
@@ -127,9 +164,12 @@ void *handle_client(void *socket_desc) {
                     char *resp = "AUTH_OK\n";
                     send(sock, resp, strlen(resp), 0);
                     printf("[Agent] Client authenticated on %s.\n", SID_TAG);
+                    log_event("AUTH_SUCCESS", client_ip, "Token verified successfully");
                 } else {
                     char *resp = "AUTH_FAILED\n";
                     send(sock, resp, strlen(resp), 0);
+                    printf("[Agent] Auth failed with token: %s\n", provided_token);
+                    log_event("AUTH_FAILURE", client_ip, "Invalid token provided");
                     break;
                 }
             } else {
@@ -140,16 +180,17 @@ void *handle_client(void *socket_desc) {
             if (strcmp(buffer, "QUIT") == 0) {
                 char *resp = "BYE\n";
                 send(sock, resp, strlen(resp), 0);
+                log_event("DISCONNECT", client_ip, "Client issued QUIT");
                 break;
             } else if (strncmp(buffer, "EXEC ", 5) == 0) {
                 char *cmd = buffer + 5;
                 printf("[Agent] Executing command: %s\n", cmd);
-                execute_system_command(sock, cmd);
+                execute_system_command(sock, cmd, client_ip);
             } else if (strncmp(buffer, "PUT ", 4) == 0) {
                 char filename[256];
                 long filesize = 0;
                 if (sscanf(buffer + 4, "%255s %ld", filename, &filesize) == 2) {
-                    handle_file_put(sock, filename, filesize);
+                    handle_file_put(sock, filename, filesize, client_ip);
                 } else {
                     char *err = "ERROR INVALID_PUT_FORMAT\n";
                     send(sock, err, strlen(err), 0);
@@ -157,7 +198,7 @@ void *handle_client(void *socket_desc) {
             } else if (strncmp(buffer, "GET ", 4) == 0) {
                 char filename[256];
                 if (sscanf(buffer + 4, "%255s", filename) == 1) {
-                    handle_file_get(sock, filename);
+                    handle_file_get(sock, filename, client_ip);
                 } else {
                     char *err = "ERROR INVALID_GET_FORMAT\n";
                     send(sock, err, strlen(err), 0);
@@ -214,13 +255,14 @@ int main() {
             continue;
         }
 
-        pthread_t tid;
-        int *new_sock = malloc(sizeof(int));
-        *new_sock = client_sock;
+        struct client_info *cinfo = malloc(sizeof(struct client_info));
+        cinfo->sock = client_sock;
+        inet_ntop(AF_INET, &client_addr.sin_addr, cinfo->ip, INET_ADDRSTRLEN);
 
-        if (pthread_create(&tid, NULL, handle_client, (void *)new_sock) < 0) {
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_client, (void *)cinfo) < 0) {
             perror("Thread creation failed");
-            free(new_sock);
+            free(cinfo);
             close(client_sock);
         } else {
             pthread_detach(tid);
