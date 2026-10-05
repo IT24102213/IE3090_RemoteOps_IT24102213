@@ -11,7 +11,39 @@
 #define PORT 9410
 #define AUTH_TOKEN "OPS-2213"
 #define SID_TAG "SID:3122"
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 2048
+
+void execute_system_command(int sock, const char *cmd) {
+    FILE *fp;
+    char path[1024];
+
+    // Security check: block harmful commands
+    if (strstr(cmd, "rm -rf") || strstr(cmd, ":(){ :|:& };:")) {
+        char *err_msg = "ERROR COMMAND_BLOCKED_SECURITY\n";
+        send(sock, err_msg, strlen(err_msg), 0);
+        return;
+    }
+
+    // Execute command and open pipe
+    fp = popen(cmd, "r");
+    if (fp == NULL) {
+        char *err_msg = "ERROR EXEC_FAILED\n";
+        send(sock, err_msg, strlen(err_msg), 0);
+        return;
+    }
+
+    char *header = "--- COMMAND OUTPUT START ---\n";
+    send(sock, header, strlen(header), 0);
+
+    // Read pipe output and send to client
+    while (fgets(path, sizeof(path), fp) != NULL) {
+        send(sock, path, strlen(path), 0);
+    }
+
+    pclose(fp);
+    char *footer = "--- COMMAND OUTPUT END ---\n";
+    send(sock, footer, strlen(footer), 0);
+}
 
 void *handle_client(void *socket_desc) {
     int sock = *(int *)socket_desc;
@@ -29,15 +61,12 @@ void *handle_client(void *socket_desc) {
         memset(buffer, 0, BUFFER_SIZE);
         int bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0);
         if (bytes_received <= 0) {
-            break; // Client disconnected or error
+            break;
         }
 
-        // Remove trailing newline / carriage return
         buffer[strcspn(buffer, "\r\n")] = 0;
-
         if (strlen(buffer) == 0) continue;
 
-        // Check authentication status
         if (!authenticated) {
             if (strncmp(buffer, "AUTH ", 5) == 0) {
                 char *provided_token = buffer + 5;
@@ -45,25 +74,28 @@ void *handle_client(void *socket_desc) {
                     authenticated = 1;
                     char *resp = "AUTH_OK\n";
                     send(sock, resp, strlen(resp), 0);
-                    printf("[Agent] Client authenticated successfully on %s.\n", SID_TAG);
+                    printf("[Agent] Client authenticated on %s.\n", SID_TAG);
                 } else {
                     char *resp = "AUTH_FAILED\n";
                     send(sock, resp, strlen(resp), 0);
-                    printf("[Agent] Authentication failed: Invalid token.\n");
-                    break; // Close connection on failed authentication
+                    printf("[Agent] Auth failed with token: %s\n", provided_token);
+                    break;
                 }
             } else {
                 char *resp = "ERROR NOT_AUTHENTICATED\n";
                 send(sock, resp, strlen(resp), 0);
             }
         } else {
-            // Once authenticated, client can execute commands
             if (strcmp(buffer, "QUIT") == 0) {
                 char *resp = "BYE\n";
                 send(sock, resp, strlen(resp), 0);
                 break;
+            } else if (strncmp(buffer, "EXEC ", 5) == 0) {
+                char *cmd = buffer + 5;
+                printf("[Agent] Executing command: %s\n", cmd);
+                execute_system_command(sock, cmd);
             } else {
-                char *resp = "COMMAND_RECEIVED\n";
+                char *resp = "ERROR INVALID_COMMAND\n";
                 send(sock, resp, strlen(resp), 0);
             }
         }
@@ -103,7 +135,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    printf("[Agent] Server running on port %d with Auth Token %s...\n", PORT, AUTH_TOKEN);
+    printf("[Agent] Server listening on port %d with Auth Token %s...\n", PORT, AUTH_TOKEN);
 
     while (1) {
         struct sockaddr_in client_addr;
