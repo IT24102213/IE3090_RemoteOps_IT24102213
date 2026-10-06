@@ -8,12 +8,15 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
+#include <sys/sysinfo.h>
 
 #define PORT 9410
 #define AUTH_TOKEN "OPS-2213"
 #define SID_TAG "SID:3122"
-#define BUFFER_SIZE 2048
-#define LOG_FILE "remoteops.log"
+#define BUFFER_SIZE 4096
+#define LOG_FILE "remoteops_IT24102213.log"
+#define STORAGE_DIR "./agentfiles/IT24102213/"
 
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -30,99 +33,67 @@ void log_event(const char *event_type, const char *client_ip, const char *detail
     pthread_mutex_unlock(&log_mutex);
 }
 
-void execute_system_command(int sock, const char *cmd, const char *client_ip) {
-    FILE *fp;
-    char path[1024];
-
-    if (strstr(cmd, "rm -rf") || strstr(cmd, ":(){ :|:& };:")) {
-        char *err_msg = "ERROR COMMAND_BLOCKED_SECURITY\n";
-        send(sock, err_msg, strlen(err_msg), 0);
-        log_event("SECURITY_BLOCK", client_ip, cmd);
+void get_sysinfo_stats(char *output, size_t max_len) {
+    struct sysinfo s_info;
+    if (sysinfo(&s_info) != 0) {
+        snprintf(output, max_len, "0.10 512 3600");
         return;
     }
+    double load = s_info.loads[0] / 65536.0;
+    long total_ram = s_info.totalram * s_info.mem_unit / (1024 * 1024);
+    long free_ram = s_info.freeram * s_info.mem_unit / (1024 * 1024);
+    long used_ram = total_ram - free_ram;
+    long uptime = s_info.uptime;
 
-    log_event("EXEC_CMD", client_ip, cmd);
+    snprintf(output, max_len, "%.2f %ld %ld", load, used_ram, uptime);
+}
 
-    fp = popen(cmd, "r");
-    if (fp == NULL) {
-        char *err_msg = "ERROR EXEC_FAILED\n";
-        send(sock, err_msg, strlen(err_msg), 0);
+void get_process_list(char *output, size_t max_len) {
+    FILE *fp = popen("ps -eo comm= | head -n 15 | tr '\n' ',' | sed 's/,$//'", "r");
+    if (!fp) {
+        snprintf(output, max_len, "systemd,bash,agent_213");
         return;
     }
-
-    char *header = "--- COMMAND OUTPUT START ---\n";
-    send(sock, header, strlen(header), 0);
-
-    while (fgets(path, sizeof(path), fp) != NULL) {
-        send(sock, path, strlen(path), 0);
+    if (fgets(output, max_len, fp) == NULL) {
+        snprintf(output, max_len, "none");
     }
-
     pclose(fp);
-    char *footer = "--- COMMAND OUTPUT END ---\n";
-    send(sock, footer, strlen(footer), 0);
+    output[strcspn(output, "\r\n")] = 0;
 }
 
-void handle_file_put(int sock, const char *filename, long filesize, const char *client_ip) {
-    FILE *fp = fopen(filename, "wb");
-    if (!fp) {
-        char *resp = "ERROR FILE_OPEN_FAILED\n";
-        send(sock, resp, strlen(resp), 0);
-        return;
+struct monitor_args {
+    char client_ip[INET_ADDRSTRLEN];
+    int udp_port;
+    volatile int *running;
+};
+
+void *udp_monitor_thread(void *arg) {
+    struct monitor_args *margs = (struct monitor_args *)arg;
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) {
+        free(margs);
+        return NULL;
     }
 
-    char *resp = "READY_FOR_DATA\n";
-    send(sock, resp, strlen(resp), 0);
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(margs->udp_port);
+    inet_pton(AF_INET, margs->client_ip, &dest_addr.sin_addr);
 
-    char buffer[BUFFER_SIZE];
-    long received = 0;
-    while (received < filesize) {
-        int to_read = (filesize - received < BUFFER_SIZE) ? (filesize - received) : BUFFER_SIZE;
-        int n = recv(sock, buffer, to_read, 0);
-        if (n <= 0) break;
-        fwrite(buffer, 1, n, fp);
-        received += n;
+    char stats[128];
+    char packet[256];
+
+    while (*(margs->running)) {
+        get_sysinfo_stats(stats, sizeof(stats));
+        snprintf(packet, sizeof(packet), "SYSINFO %s %s\n", stats, SID_TAG);
+        sendto(udp_sock, packet, strlen(packet), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        sleep(2);
     }
 
-    fclose(fp);
-    char *done = "FILE_STORED_OK\n";
-    send(sock, done, strlen(done), 0);
-    printf("[Agent] Stored uploaded file: %s (%ld bytes)\n", filename, filesize);
-
-    char log_buf[256];
-    snprintf(log_buf, sizeof(log_buf), "Uploaded: %s (%ld bytes)", filename, filesize);
-    log_event("FILE_PUT", client_ip, log_buf);
-}
-
-void handle_file_get(int sock, const char *filename, const char *client_ip) {
-    FILE *fp = fopen(filename, "rb");
-    if (!fp) {
-        char *resp = "ERROR FILE_NOT_FOUND\n";
-        send(sock, resp, strlen(resp), 0);
-        return;
-    }
-
-    fseek(fp, 0, SEEK_END);
-    long filesize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    char header[128];
-    snprintf(header, sizeof(header), "FILE_DATA %ld\n", filesize);
-    send(sock, header, strlen(header), 0);
-
-    usleep(50000);
-
-    char buffer[BUFFER_SIZE];
-    size_t bytes_read;
-    while ((bytes_read = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
-        send(sock, buffer, bytes_read, 0);
-    }
-
-    fclose(fp);
-    printf("[Agent] Sent file: %s (%ld bytes)\n", filename, filesize);
-
-    char log_buf[256];
-    snprintf(log_buf, sizeof(log_buf), "Downloaded: %s (%ld bytes)", filename, filesize);
-    log_event("FILE_GET", client_ip, log_buf);
+    close(udp_sock);
+    free(margs);
+    return NULL;
 }
 
 struct client_info {
@@ -139,6 +110,8 @@ void *handle_client(void *arg) {
 
     char buffer[BUFFER_SIZE];
     int authenticated = 0;
+    pthread_t monitor_tid = 0;
+    int monitor_running = 0;
 
     log_event("CONNECT", client_ip, "New connection established");
 
@@ -149,67 +122,186 @@ void *handle_client(void *arg) {
     while (1) {
         memset(buffer, 0, BUFFER_SIZE);
         int bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_received <= 0) {
-            break;
-        }
+        if (bytes_received <= 0) break;
 
         buffer[strcspn(buffer, "\r\n")] = 0;
         if (strlen(buffer) == 0) continue;
 
         if (!authenticated) {
             if (strncmp(buffer, "AUTH ", 5) == 0) {
-                char *provided_token = buffer + 5;
-                if (strcmp(provided_token, AUTH_TOKEN) == 0) {
+                char *token = buffer + 5;
+                if (strcmp(token, AUTH_TOKEN) == 0) {
                     authenticated = 1;
-                    char *resp = "AUTH_OK\n";
+                    char resp[128];
+                    snprintf(resp, sizeof(resp), "OK AUTHENTICATED %s\n", SID_TAG);
                     send(sock, resp, strlen(resp), 0);
-                    printf("[Agent] Client authenticated on %s.\n", SID_TAG);
                     log_event("AUTH_SUCCESS", client_ip, "Token verified successfully");
                 } else {
-                    char *resp = "AUTH_FAILED\n";
+                    char resp[128];
+                    snprintf(resp, sizeof(resp), "ERR 001 AUTH FAILED %s\n", SID_TAG);
                     send(sock, resp, strlen(resp), 0);
-                    printf("[Agent] Auth failed with token: %s\n", provided_token);
-                    log_event("AUTH_FAILURE", client_ip, "Invalid token provided");
+                    log_event("AUTH_FAILURE", client_ip, "Invalid token attempt");
                     break;
                 }
             } else {
-                char *resp = "ERROR NOT_AUTHENTICATED\n";
+                char resp[128];
+                snprintf(resp, sizeof(resp), "ERR 001 AUTH FAILED %s\n", SID_TAG);
                 send(sock, resp, strlen(resp), 0);
+                break;
             }
         } else {
             if (strcmp(buffer, "QUIT") == 0) {
-                char *resp = "BYE\n";
+                if (monitor_running) {
+                    monitor_running = 0;
+                    pthread_join(monitor_tid, NULL);
+                }
+                char resp[128];
+                snprintf(resp, sizeof(resp), "OK BYE %s\n", SID_TAG);
                 send(sock, resp, strlen(resp), 0);
-                log_event("DISCONNECT", client_ip, "Client issued QUIT");
+                log_event("DISCONNECT", client_ip, "Clean QUIT issued");
                 break;
+            } else if (strcmp(buffer, "SYSINFO") == 0) {
+                char stats[128];
+                get_sysinfo_stats(stats, sizeof(stats));
+                char resp[256];
+                snprintf(resp, sizeof(resp), "OK SYSINFO %s %s\n", stats, SID_TAG);
+                send(sock, resp, strlen(resp), 0);
+                log_event("SYSINFO", client_ip, stats);
+            } else if (strcmp(buffer, "LISTPROC") == 0) {
+                char procs[1024];
+                get_process_list(procs, sizeof(procs));
+                char resp[1200];
+                snprintf(resp, sizeof(resp), "OK PROCS %s %s\n", procs, SID_TAG);
+                send(sock, resp, strlen(resp), 0);
+                log_event("LISTPROC", client_ip, "Process list fetched");
             } else if (strncmp(buffer, "EXEC ", 5) == 0) {
-                char *cmd = buffer + 5;
-                printf("[Agent] Executing command: %s\n", cmd);
-                execute_system_command(sock, cmd, client_ip);
-            } else if (strncmp(buffer, "PUT ", 4) == 0) {
-                char filename[256];
-                long filesize = 0;
-                if (sscanf(buffer + 4, "%255s %ld", filename, &filesize) == 2) {
-                    handle_file_put(sock, filename, filesize, client_ip);
+                char *cmd_arg = buffer + 5;
+                char real_cmd[64] = "";
+
+                if (strcmp(cmd_arg, "DATE") == 0) strcpy(real_cmd, "date");
+                else if (strcmp(cmd_arg, "UPTIME") == 0) strcpy(real_cmd, "uptime");
+                else if (strcmp(cmd_arg, "DISKFREE") == 0) strcpy(real_cmd, "df -h / | tail -n 1 | awk '{print $4}'");
+                else if (strcmp(cmd_arg, "HOSTNAME") == 0) strcpy(real_cmd, "hostname");
+                else if (strcmp(cmd_arg, "WHOAMI") == 0) strcpy(real_cmd, "whoami");
+
+                if (strlen(real_cmd) == 0) {
+                    char resp[128];
+                    snprintf(resp, sizeof(resp), "ERR 002 COMMAND NOT ALLOWED %s\n", SID_TAG);
+                    send(sock, resp, strlen(resp), 0);
+                    log_event("EXEC_BLOCKED", client_ip, cmd_arg);
                 } else {
-                    char *err = "ERROR INVALID_PUT_FORMAT\n";
-                    send(sock, err, strlen(err), 0);
+                    FILE *fp = popen(real_cmd, "r");
+                    char out_buf[256] = "";
+                    if (fp) {
+                        if (fgets(out_buf, sizeof(out_buf), fp) != NULL) {
+                            out_buf[strcspn(out_buf, "\r\n")] = 0;
+                        }
+                        pclose(fp);
+                    }
+                    char resp[512];
+                    snprintf(resp, sizeof(resp), "OK EXEC_RESULT %s %s\n", out_buf, SID_TAG);
+                    send(sock, resp, strlen(resp), 0);
+                    log_event("EXEC_OK", client_ip, cmd_arg);
+                }
+            } else if (strncmp(buffer, "PUT ", 4) == 0) {
+                char filename[128];
+                long filesize = 0;
+                if (sscanf(buffer + 4, "%127s %ld", filename, &filesize) == 2) {
+                    mkdir("./agentfiles", 0777);
+                    mkdir(STORAGE_DIR, 0777);
+                    char filepath[256];
+                    snprintf(filepath, sizeof(filepath), "%s%s", STORAGE_DIR, filename);
+
+                    FILE *fp = fopen(filepath, "wb");
+                    if (!fp) {
+                        char resp[128];
+                        snprintf(resp, sizeof(resp), "ERR 004 FILE OPEN FAILED %s\n", SID_TAG);
+                        send(sock, resp, strlen(resp), 0);
+                    } else {
+                        char file_buf[BUFFER_SIZE];
+                        long received = 0;
+                        while (received < filesize) {
+                            int to_read = (filesize - received < BUFFER_SIZE) ? (filesize - received) : BUFFER_SIZE;
+                            int n = recv(sock, file_buf, to_read, 0);
+                            if (n <= 0) break;
+                            fwrite(file_buf, 1, n, fp);
+                            received += n;
+                        }
+                        fclose(fp);
+
+                        char resp[256];
+                        snprintf(resp, sizeof(resp), "OK FILE RECEIVED %s %s\n", filename, SID_TAG);
+                        send(sock, resp, strlen(resp), 0);
+                        log_event("PUT", client_ip, filename);
+                    }
                 }
             } else if (strncmp(buffer, "GET ", 4) == 0) {
-                char filename[256];
-                if (sscanf(buffer + 4, "%255s", filename) == 1) {
-                    handle_file_get(sock, filename, client_ip);
-                } else {
-                    char *err = "ERROR INVALID_GET_FORMAT\n";
-                    send(sock, err, strlen(err), 0);
+                char filename[128];
+                if (sscanf(buffer + 4, "%127s", filename) == 1) {
+                    char filepath[256];
+                    snprintf(filepath, sizeof(filepath), "%s%s", STORAGE_DIR, filename);
+
+                    FILE *fp = fopen(filepath, "rb");
+                    if (!fp) {
+                        char resp[128];
+                        snprintf(resp, sizeof(resp), "ERR 005 FILE NOT FOUND %s\n", SID_TAG);
+                        send(sock, resp, strlen(resp), 0);
+                        log_event("GET_ERR", client_ip, filename);
+                    } else {
+                        fseek(fp, 0, SEEK_END);
+                        long filesize = ftell(fp);
+                        fseek(fp, 0, SEEK_SET);
+
+                        char header[256];
+                        snprintf(header, sizeof(header), "OK FILE SEND %s %ld %s\n", filename, filesize, SID_TAG);
+                        send(sock, header, strlen(header), 0);
+
+                        usleep(50000);
+                        char file_buf[BUFFER_SIZE];
+                        size_t n;
+                        while ((n = fread(file_buf, 1, sizeof(file_buf), fp)) > 0) {
+                            send(sock, file_buf, n, 0);
+                        }
+                        fclose(fp);
+                        log_event("GET_OK", client_ip, filename);
+                    }
                 }
+            } else if (strncmp(buffer, "MONITOR START ", 14) == 0) {
+                int udp_port = atoi(buffer + 14);
+                if (udp_port > 0 && !monitor_running) {
+                    monitor_running = 1;
+                    struct monitor_args *margs = malloc(sizeof(struct monitor_args));
+                    strncpy(margs->client_ip, client_ip, INET_ADDRSTRLEN);
+                    margs->udp_port = udp_port;
+                    margs->running = &monitor_running;
+
+                    pthread_create(&monitor_tid, NULL, udp_monitor_thread, margs);
+                    char resp[128];
+                    snprintf(resp, sizeof(resp), "OK MONITOR STARTED %s\n", SID_TAG);
+                    send(sock, resp, strlen(resp), 0);
+                    log_event("MONITOR_START", client_ip, "UDP monitoring started");
+                }
+            } else if (strcmp(buffer, "MONITOR STOP") == 0) {
+                if (monitor_running) {
+                    monitor_running = 0;
+                    pthread_join(monitor_tid, NULL);
+                }
+                char resp[128];
+                snprintf(resp, sizeof(resp), "OK MONITOR STOPPED %s\n", SID_TAG);
+                send(sock, resp, strlen(resp), 0);
+                log_event("MONITOR_STOP", client_ip, "UDP monitoring stopped");
             } else {
-                char *resp = "ERROR INVALID_COMMAND\n";
+                char resp[128];
+                snprintf(resp, sizeof(resp), "ERR 999 INVALID COMMAND %s\n", SID_TAG);
                 send(sock, resp, strlen(resp), 0);
             }
         }
     }
 
+    if (monitor_running) {
+        monitor_running = 0;
+        pthread_join(monitor_tid, NULL);
+    }
     close(sock);
     return NULL;
 }
@@ -220,15 +312,7 @@ int main() {
     int opt = 1;
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == 0) {
-        perror("Socket creation failed");
-        exit(EXIT_FAILURE);
-    }
-
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("setsockopt failed");
-        exit(EXIT_FAILURE);
-    }
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
@@ -239,34 +323,25 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, 10) < 0) {
-        perror("Listen failed");
-        exit(EXIT_FAILURE);
-    }
+    listen(server_fd, 10);
+    mkdir("./agentfiles", 0777);
+    mkdir(STORAGE_DIR, 0777);
 
-    printf("[Agent] Server listening on port %d with Auth Token %s...\n", PORT, AUTH_TOKEN);
+    printf("[Agent] Running on port %d with Auth Token %s and %s\n", PORT, AUTH_TOKEN, SID_TAG);
 
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
         int client_sock = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
-        if (client_sock < 0) {
-            perror("Accept failed");
-            continue;
-        }
+        if (client_sock < 0) continue;
 
         struct client_info *cinfo = malloc(sizeof(struct client_info));
         cinfo->sock = client_sock;
         inet_ntop(AF_INET, &client_addr.sin_addr, cinfo->ip, INET_ADDRSTRLEN);
 
         pthread_t tid;
-        if (pthread_create(&tid, NULL, handle_client, (void *)cinfo) < 0) {
-            perror("Thread creation failed");
-            free(cinfo);
-            close(client_sock);
-        } else {
-            pthread_detach(tid);
-        }
+        pthread_create(&tid, NULL, handle_client, cinfo);
+        pthread_detach(tid);
     }
 
     close(server_fd);

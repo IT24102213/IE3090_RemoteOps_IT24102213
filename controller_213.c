@@ -6,165 +6,202 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
-#define DEFAULT_PORT 9410
-#define DEFAULT_IP "127.0.0.1"
+#define BUFFER_SIZE 4096
 #define AUTH_TOKEN "OPS-2213"
-#define BUFFER_SIZE 2048
 
-void send_file_put(int sock, const char *local_file) {
-    FILE *fp = fopen(local_file, "rb");
-    if (!fp) {
-        printf("[Controller] Local file not found: %s\n", local_file);
-        return;
+volatile int udp_listener_active = 0;
+pthread_t udp_listener_tid = 0;
+
+void *udp_listener_thread(void *arg) {
+    int port = *(int *)arg;
+    free(arg);
+
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in saddr;
+    memset(&saddr, 0, sizeof(saddr));
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = INADDR_ANY;
+    saddr.sin_port = htons(port);
+
+    if (bind(udp_sock, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
+        perror("UDP bind failed");
+        close(udp_sock);
+        return NULL;
     }
 
-    fseek(fp, 0, SEEK_END);
-    long filesize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    char put_cmd[512];
-    snprintf(put_cmd, sizeof(put_cmd), "PUT %s %ld\n", local_file, filesize);
-    send(sock, put_cmd, strlen(put_cmd), 0);
-
-    char resp[128];
-    memset(resp, 0, sizeof(resp));
-    recv(sock, resp, sizeof(resp) - 1, 0);
-
-    if (strncmp(resp, "READY_FOR_DATA", 14) == 0) {
-        char buffer[BUFFER_SIZE];
-        size_t bytes_read;
-        while ((bytes_read = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
-            send(sock, buffer, bytes_read, 0);
+    char buf[512];
+    while (udp_listener_active) {
+        struct timeval tv = {1, 0};
+        setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        int n = recvfrom(udp_sock, buf, sizeof(buf) - 1, 0, NULL, NULL);
+        if (n > 0) {
+            buf[n] = '\0';
+            printf("\n[UDP MONITOR DATAGRAM] %s> ", buf);
+            fflush(stdout);
         }
-        memset(resp, 0, sizeof(resp));
-        recv(sock, resp, sizeof(resp) - 1, 0);
-        printf("[Controller PUT Status] %s", resp);
-    } else {
-        printf("[Controller PUT Error] %s\n", resp);
     }
-
-    fclose(fp);
-}
-
-void get_file_download(int sock, const char *remote_file, const char *saved_as) {
-    char get_cmd[512];
-    snprintf(get_cmd, sizeof(get_cmd), "GET %s\n", remote_file);
-    send(sock, get_cmd, strlen(get_cmd), 0);
-
-    char header[128];
-    memset(header, 0, sizeof(header));
-    recv(sock, header, sizeof(header) - 1, 0);
-
-    if (strncmp(header, "FILE_DATA", 9) == 0) {
-        long filesize = 0;
-        sscanf(header + 10, "%ld", &filesize);
-
-        FILE *fp = fopen(saved_as, "wb");
-        if (!fp) {
-            printf("[Controller] Failed to create local file: %s\n", saved_as);
-            return;
-        }
-
-        char buffer[BUFFER_SIZE];
-        long received = 0;
-        while (received < filesize) {
-            int to_read = (filesize - received < BUFFER_SIZE) ? (filesize - received) : BUFFER_SIZE;
-            int n = recv(sock, buffer, to_read, 0);
-            if (n <= 0) break;
-            fwrite(buffer, 1, n, fp);
-            received += n;
-        }
-
-        fclose(fp);
-        printf("[Controller GET Status] Downloaded %s successfully (%ld bytes)\n", saved_as, filesize);
-    } else {
-        printf("[Controller GET Error] %s\n", header);
-    }
+    close(udp_sock);
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    int sock;
-    struct sockaddr_in server_addr;
+    if (argc < 3) {
+        printf("Usage: %s <Agent_IP> <Port>\n", argv[0]);
+        return 1;
+    }
+
+    char *server_ip = argv[1];
+    int port = atoi(argv[2]);
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in serv_addr;
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(port);
+    inet_pton(AF_INET, server_ip, &serv_addr.sin_addr);
+
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        perror("Connection Failed");
+        return 1;
+    }
+
     char buffer[BUFFER_SIZE];
-    char *server_ip = DEFAULT_IP;
-    int port = DEFAULT_PORT;
-
-    if (argc >= 2) server_ip = argv[1];
-    if (argc >= 3) port = atoi(argv[2]);
-
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("Socket creation failed");
-        exit(EXIT_FAILURE);
-    }
-
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-
-    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
-        perror("Invalid server address");
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
-
-    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Connection failed");
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
-
-    memset(buffer, 0, BUFFER_SIZE);
-    recv(sock, buffer, BUFFER_SIZE - 1, 0);
+    int bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
+    buffer[bytes] = '\0';
     printf("[Agent Greeting] %s", buffer);
 
     char auth_cmd[128];
     snprintf(auth_cmd, sizeof(auth_cmd), "AUTH %s\n", AUTH_TOKEN);
     send(sock, auth_cmd, strlen(auth_cmd), 0);
 
-    memset(buffer, 0, BUFFER_SIZE);
-    recv(sock, buffer, BUFFER_SIZE - 1, 0);
+    bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
+    buffer[bytes] = '\0';
     printf("[Auth Response] %s", buffer);
 
-    if (strstr(buffer, "AUTH_OK") == NULL) {
-        printf("Auth failed.\n");
+    if (strncmp(buffer, "OK AUTHENTICATED", 16) != 0) {
+        printf("Authentication failed. Exiting.\n");
         close(sock);
         return 1;
     }
 
-    printf("[Controller] Commands: EXEC <cmd> | PUT <file> | GET <remote_file> <save_as> | QUIT\n> ");
+    printf("\n=== RemoteOps Controller Connected ===\n");
+    printf("Commands: SYSINFO | LISTPROC | EXEC <cmd> | PUT <file> | GET <file> | MONITOR START <port> | MONITOR STOP | QUIT\n");
 
-    while (fgets(buffer, BUFFER_SIZE, stdin) != NULL) {
-        buffer[strcspn(buffer, "\r\n")] = 0;
-        if (strlen(buffer) == 0) {
-            printf("> ");
-            continue;
-        }
+    while (1) {
+        printf("> ");
+        fflush(stdout);
 
-        if (strcmp(buffer, "QUIT") == 0) {
+        char user_input[512];
+        if (!fgets(user_input, sizeof(user_input), stdin)) break;
+        user_input[strcspn(user_input, "\r\n")] = 0;
+        if (strlen(user_input) == 0) continue;
+
+        if (strcmp(user_input, "QUIT") == 0) {
             send(sock, "QUIT\n", 5, 0);
-            break;
-        } else if (strncmp(buffer, "PUT ", 4) == 0) {
-            char filename[256];
-            sscanf(buffer + 4, "%255s", filename);
-            send_file_put(sock, filename);
-            printf("> ");
-        } else if (strncmp(buffer, "GET ", 4) == 0) {
-            char remote_file[256], saved_as[256];
-            if (sscanf(buffer + 4, "%255s %255s", remote_file, saved_as) == 2) {
-                get_file_download(sock, remote_file, saved_as);
-            } else {
-                printf("Usage: GET <remote_file> <save_as>\n");
+            recv(sock, buffer, BUFFER_SIZE - 1, 0);
+            if (udp_listener_active) {
+                udp_listener_active = 0;
+                pthread_join(udp_listener_tid, NULL);
             }
-            printf("> ");
+            break;
+        } else if (strncmp(user_input, "PUT ", 4) == 0) {
+            char filename[128];
+            sscanf(user_input + 4, "%127s", filename);
+
+            FILE *fp = fopen(filename, "rb");
+            if (!fp) {
+                printf("[Error] Cannot open local file %s\n", filename);
+                continue;
+            }
+            fseek(fp, 0, SEEK_END);
+            long filesize = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "PUT %s %ld\n", filename, filesize);
+            send(sock, cmd, strlen(cmd), 0);
+
+            usleep(20000);
+            char file_buf[BUFFER_SIZE];
+            size_t n;
+            while ((n = fread(file_buf, 1, sizeof(file_buf), fp)) > 0) {
+                send(sock, file_buf, n, 0);
+            }
+            fclose(fp);
+
+            bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
+            buffer[bytes] = '\0';
+            printf("[Agent Response] %s", buffer);
+        } else if (strncmp(user_input, "GET ", 4) == 0) {
+            char filename[128];
+            sscanf(user_input + 4, "%127s", filename);
+
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "GET %s\n", filename);
+            send(sock, cmd, strlen(cmd), 0);
+
+            bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
+            buffer[bytes] = '\0';
+
+            if (strncmp(buffer, "OK FILE SEND", 12) == 0) {
+                char fname[128];
+                long filesize = 0;
+                sscanf(buffer + 13, "%127s %ld", fname, &filesize);
+
+                char out_name[256];
+                snprintf(out_name, sizeof(out_name), "downloaded_%s", fname);
+                FILE *fp = fopen(out_name, "wb");
+
+                char file_buf[BUFFER_SIZE];
+                long received = 0;
+                while (received < filesize) {
+                    int to_read = (filesize - received < BUFFER_SIZE) ? (filesize - received) : BUFFER_SIZE;
+                    int n = recv(sock, file_buf, to_read, 0);
+                    if (n <= 0) break;
+                    fwrite(file_buf, 1, n, fp);
+                    received += n;
+                }
+                fclose(fp);
+                printf("[Controller] Successfully received %s (%ld bytes) -> saved as %s\n", fname, filesize, out_name);
+            } else {
+                printf("[Agent Response] %s", buffer);
+            }
+        } else if (strncmp(user_input, "MONITOR START ", 14) == 0) {
+            int uport = atoi(user_input + 14);
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "MONITOR START %d\n", uport);
+            send(sock, cmd, strlen(cmd), 0);
+
+            bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
+            buffer[bytes] = '\0';
+            printf("[Agent Response] %s", buffer);
+
+            if (strncmp(buffer, "OK MONITOR STARTED", 18) == 0 && !udp_listener_active) {
+                udp_listener_active = 1;
+                int *port_arg = malloc(sizeof(int));
+                *port_arg = uport;
+                pthread_create(&udp_listener_tid, NULL, udp_listener_thread, port_arg);
+            }
+        } else if (strcmp(user_input, "MONITOR STOP") == 0) {
+            send(sock, "MONITOR STOP\n", 13, 0);
+            bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
+            buffer[bytes] = '\0';
+            printf("[Agent Response] %s", buffer);
+
+            if (udp_listener_active) {
+                udp_listener_active = 0;
+                pthread_join(udp_listener_tid, NULL);
+            }
         } else {
-            strcat(buffer, "\n");
-            send(sock, buffer, strlen(buffer), 0);
-            memset(buffer, 0, BUFFER_SIZE);
-            int bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
+            char cmd[512];
+            snprintf(cmd, sizeof(cmd), "%s\n", user_input);
+            send(sock, cmd, strlen(cmd), 0);
+
+            bytes = recv(sock, buffer, BUFFER_SIZE - 1, 0);
             if (bytes > 0) {
                 buffer[bytes] = '\0';
-                printf("[Agent Response] %s> ", buffer);
+                printf("[Agent Response] %s", buffer);
             }
         }
     }
