@@ -1,8 +1,8 @@
 # Design Diary: RemoteOps Implementation
 
-**Student ID:** IT24102213 
-**Student Name:** P. Arachchige Adeesa Induranga 
-**Module:** IE3090 – Network Programming 
+**Student ID:** IT24102213  
+**Student Name:** P. Arachchige Adeesa Induranga  
+**Module:** IE3090 – Network Programming  
 
 ---
 
