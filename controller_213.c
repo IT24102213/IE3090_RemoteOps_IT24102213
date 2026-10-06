@@ -194,7 +194,7 @@ int main(int argc, char *argv[]) {
                 pthread_join(udp_listener_tid, NULL);
             }
         } else {
-            char cmd[512];
+            char cmd[1024];
             snprintf(cmd, sizeof(cmd), "%s\n", user_input);
             send(sock, cmd, strlen(cmd), 0);
 
